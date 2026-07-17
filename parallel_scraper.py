@@ -200,6 +200,40 @@ class SessionCookies:
     def stop(self) -> None:
         self._stop.set()
 
+    def refresh_periodically(self) -> None:
+        """Harvest and activate a new cookie between download batches."""
+        print("\n>>> Download limit reached — refreshing the session cookie...\n", flush=True)
+        self.harvest_fresh(juris=self.juris)
+        # The active worker session still has the old cookie.  Recreate it on
+        # the next request using the freshly written session.py value.
+        _local.session = None
+        _local.cookie = None
+        _local.downloads_on_cookie = 0
+        self.kick_backup()
+
+
+class PeriodicRefresh:
+    """Track newly downloaded PDFs and refresh only between safe batches."""
+
+    def __init__(self, every: int) -> None:
+        self.every = every
+        self.downloaded_since_refresh = 0
+
+    @property
+    def batch_size(self) -> int | None:
+        if self.every <= 0:
+            return None
+        return max(1, self.every - self.downloaded_since_refresh)
+
+    def record(self, *, downloaded: bool) -> None:
+        if downloaded and self.every > 0:
+            self.downloaded_since_refresh += 1
+
+    def refresh_if_due(self, sessions: SessionCookies) -> None:
+        if self.every > 0 and self.downloaded_since_refresh >= self.every:
+            sessions.refresh_periodically()
+            self.downloaded_since_refresh = 0
+
 
 _local = threading.local()
 
@@ -326,6 +360,7 @@ def _run_downloads(
     tasks: list[dict],
     workers: int,
     label: str,
+    periodic_refresh: PeriodicRefresh | None = None,
 ) -> tuple[int, list[dict]]:
     """Download a batch; return (ok_count, failed_tasks)."""
     total = len(tasks)
@@ -334,27 +369,37 @@ def _run_downloads(
     ok = 0
     failed: list[dict] = []
     done = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(download_task, sessions, limiter, t) for t in tasks]
-        for fut in as_completed(futs):
-            try:
-                task, got, msg = fut.result()
-            except AccessTemporarilyBlocked:
-                for pending in futs:
-                    pending.cancel()
-                raise
-            if got:
-                ok += 1
-            else:
-                task["_fail_msg"] = msg
-                failed.append(task)
-            done += 1
-            bar = (
-                f"  {label}: [{done}/{total}] ok={ok} fail={len(failed)} "
-                f"| {tor_util.ip_label()}"
-            )
-            sys.stdout.write("\r" + bar.ljust(96))
-            sys.stdout.flush()
+    remaining = list(tasks)
+    while remaining:
+        batch_size = periodic_refresh.batch_size if periodic_refresh else None
+        batch = remaining if batch_size is None else remaining[:batch_size]
+        remaining = [] if batch_size is None else remaining[batch_size:]
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(download_task, sessions, limiter, t) for t in batch]
+            for fut in as_completed(futs):
+                try:
+                    task, got, msg = fut.result()
+                except AccessTemporarilyBlocked:
+                    for pending in futs:
+                        pending.cancel()
+                    raise
+                if got:
+                    ok += 1
+                    if periodic_refresh:
+                        # Existing files are resumed/skipped, not fresh downloads.
+                        periodic_refresh.record(downloaded=msg != "exists")
+                else:
+                    task["_fail_msg"] = msg
+                    failed.append(task)
+                done += 1
+                bar = (
+                    f"  {label}: [{done}/{total}] ok={ok} fail={len(failed)} "
+                    f"| {tor_util.ip_label()}"
+                )
+                sys.stdout.write("\r" + bar.ljust(96))
+                sys.stdout.flush()
+        if periodic_refresh:
+            periodic_refresh.refresh_if_due(sessions)
     sys.stdout.write("\r" + " " * 96 + "\r")
     return ok, failed
 
@@ -378,10 +423,11 @@ def _download_year_with_retries(
     records: list[dict],
     workers: int,
     label: str,
+    periodic_refresh: PeriodicRefresh | None = None,
     max_retry_rounds: int = 3,
 ) -> tuple[int, int]:
     """Download all tasks, retry transient failures, update records. Returns (ok, fail)."""
-    ok, failed = _run_downloads(sessions, limiter, tasks, workers, label)
+    ok, failed = _run_downloads(sessions, limiter, tasks, workers, label, periodic_refresh)
     permanent = [t for t in failed if _permanent_fail(t.get("_fail_msg", ""))]
     retryable = [t for t in failed if not _permanent_fail(t.get("_fail_msg", ""))]
 
@@ -390,7 +436,9 @@ def _download_year_with_retries(
     while retryable and round_no < max_retry_rounds:
         round_no += 1
         print(f"  {label}: retrying {len(retryable)} failed (round {round_no}/{max_retry_rounds})...", flush=True)
-        ok2, failed = _run_downloads(sessions, limiter, retryable, workers, f"{label} retry")
+        ok2, failed = _run_downloads(
+            sessions, limiter, retryable, workers, f"{label} retry", periodic_refresh,
+        )
         ok += ok2
         permanent.extend(t for t in failed if _permanent_fail(t.get("_fail_msg", "")))
         retryable = [t for t in failed if not _permanent_fail(t.get("_fail_msg", ""))]
@@ -484,7 +532,7 @@ def _get_items(
         return []
 
 
-def _scrape_juris(sessions, limiter, juris, db_arg, args, grand) -> None:
+def _scrape_juris(sessions, limiter, juris, db_arg, args, grand, periodic_refresh) -> None:
     sessions.juris = juris
     out = cs.OUT_ROOT
     all_dbs = _discover_databases(sessions, limiter, juris)
@@ -526,7 +574,7 @@ def _scrape_juris(sessions, limiter, juris, db_arg, args, grand) -> None:
 
             label = f"{juris}/{db}/{year}"
             ok, fail = _download_year_with_retries(
-                sessions, limiter, tasks, records, args.workers, label,
+                sessions, limiter, tasks, records, args.workers, label, periodic_refresh,
             )
             print(f"  {label}: {len(tasks)} decisions -> {ok} ok, {fail} failed")
 
@@ -552,6 +600,8 @@ def main() -> int:
     ap.add_argument("--good-exit-threshold", type=int,
                     default=tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD,
                     help="Tor: reuse exit IP when cookie burned after this many PDFs (default: 10)")
+    ap.add_argument("--refresh-every", type=int, default=20,
+                    help="Refresh the cookie after this many newly downloaded PDFs (default: 20; 0 disables)")
     ap.add_argument("--no-backup-cookie", action="store_true",
                     help="Disable the single background backup cookie harvest")
     ap.add_argument("--tor", action="store_true",
@@ -574,6 +624,7 @@ def main() -> int:
 
     jurisdictions = list(cs.JURISDICTIONS.keys()) if args.juris == "all" else [args.juris]
     grand = {"total": 0, "downloaded": 0, "failed": 0}
+    periodic_refresh = PeriodicRefresh(max(0, args.refresh_every))
 
     tor_on = tor_util.enabled()
     if tor_on and args.new_ip:
@@ -587,8 +638,9 @@ def main() -> int:
         )
 
     print(f"Scrape: {args.workers} workers, {limiter.label()} req/s "
-          f"| backup cookie: {'off' if not backup_enabled else 'one'} "
-          f"| tor: {'on' if tor_on else 'off'}"
+           f"| backup cookie: {'off' if not backup_enabled else 'one'} "
+           f"| refresh every: {args.refresh_every if args.refresh_every > 0 else 'off'} PDFs "
+           f"| tor: {'on' if tor_on else 'off'}"
           f"{f' | good-exit: {tor_util.good_exit_threshold()}+ PDFs' if tor_on else ''} "
           f"(structure: {cs.OUT_ROOT}/<state>/<db>/<year>/)\n")
     tor_util.print_ip()
@@ -598,7 +650,7 @@ def main() -> int:
 
     try:
         for juris in jurisdictions:
-            _scrape_juris(sessions, limiter, juris, args.db, args, grand)
+            _scrape_juris(sessions, limiter, juris, args.db, args, grand, periodic_refresh)
     except AccessTemporarilyBlocked:
         print("\nAccess temporarily blocked — stopping this run for supervisor restart.", flush=True)
         return 75

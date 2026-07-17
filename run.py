@@ -45,6 +45,7 @@ AUTO_STEPS = """
 TEMP_BLOCK_EXIT = 75
 DEFAULT_RESTART_DELAY = 60.0
 DEFAULT_MAX_RESTARTS = 20
+DEFAULT_REFRESH_EVERY = 20
 
 
 def _reload_session() -> None:
@@ -205,11 +206,13 @@ def run_scrape(
     use_tor: bool = False,
     good_exit_threshold: int = tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD,
     force_new_ip: bool = False,
+    refresh_every: int = DEFAULT_REFRESH_EVERY,
 ) -> int:
     """Single-worker scrape with a request/sec cap; resume same settings on hard block."""
     cmd = [sys.executable, "parallel_scraper.py", "--juris", juris, "--db", *db_list,
            "--years", years, "--workers", "1", "--rate", str(rate),
-           "--good-exit-threshold", str(good_exit_threshold)]
+           "--good-exit-threshold", str(good_exit_threshold),
+           "--refresh-every", str(refresh_every)]
     if use_tor:
         cmd.append("--tor")
     if use_tor and force_new_ip:
@@ -264,6 +267,7 @@ def main() -> int:
             return 130
         restart_delay = DEFAULT_RESTART_DELAY
         max_restarts = DEFAULT_MAX_RESTARTS
+        refresh_every = DEFAULT_REFRESH_EVERY
     else:
         use_tor = bool(tor_flag)
         if use_tor:
@@ -281,6 +285,7 @@ def main() -> int:
         )
         restart_delay = _extract_opt(args, "--restart-delay", float, DEFAULT_RESTART_DELAY)
         max_restarts = _extract_opt(args, "--max-restarts", int, DEFAULT_MAX_RESTARTS)
+        refresh_every = max(0, _extract_opt(args, "--refresh-every", int, DEFAULT_REFRESH_EVERY))
         if "--db" not in args:
             print("Provide --db <code...|all> (or run 'python run.py' for interactive mode).")
             return 1
@@ -293,6 +298,7 @@ def main() -> int:
 
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
           f"rate={rate} req/s good-exit={good_exit}+ PDFs"
+          f" refresh-every={refresh_every if refresh_every else 'off'} PDFs"
           f"{' (Tor)' if use_tor else ''}"
           f"{' new-ip' if use_tor and force_new_ip else ''} "
           f"| OS: {platform_util.system()} "
@@ -326,6 +332,7 @@ def main() -> int:
         use_tor=use_tor,
         good_exit_threshold=good_exit,
         force_new_ip=force_new_ip,
+        refresh_every=refresh_every,
     )
 
 

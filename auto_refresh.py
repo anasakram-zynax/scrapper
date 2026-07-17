@@ -359,12 +359,15 @@ def _has_display() -> bool:
 
 
 def _try_auto_slider_first(*, quiet: bool = False, juris: str = "on") -> str:
-    """SeleniumBase + PyAutoGUI before AppleScript (AppleScript cannot drag the slider)."""
-    if platform_util.is_macos():
-        return _try_sb_mint(quiet=quiet, juris=juris)
-    if auto_solve_capable(force_recheck=True):
-        return _try_sb_mint(quiet=quiet, juris=juris)
-    return ""
+    """Attempt the SeleniumBase solver before falling back to manual harvest.
+
+    Do not gate this on the PyAutoGUI preflight check.  The Tor flow has always
+    attempted this path unconditionally; doing the same for a direct Chrome
+    session lets SeleniumBase provision its runtime and try the CDP solver.
+    If desktop automation is unavailable, _try_sb_mint() handles the failure
+    and the caller continues to the manual browser fallback.
+    """
+    return _try_sb_mint(quiet=quiet, juris=juris)
 
 
 def _accept_cookie(cookie: str, ua: str, *, juris: str = "on") -> str:
@@ -452,7 +455,10 @@ def harvest_cookie(*, juris: str = "on") -> str:
             pass
 
     cookie = harvest_cookie_browser(
-        try_auto=platform_util.is_macos() or auto_solve_capable(force_recheck=True),
+        # Keep trying the CDP/OCR helpers in the fallback window too.  A
+        # PyAutoGUI preflight failure should not disable those independent
+        # automation paths; manual solving remains the fallback on failure.
+        try_auto=True,
     )
     if "datadome=" in cookie:
         return cookie
