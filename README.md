@@ -16,7 +16,8 @@ Example: `data/on/onlrb/2026/2026canlii63962.pdf`
 ## 1. Setup (after clone)
 
 ```bash
-git clone https://github.com/zainiqbal-ml1/scrapper.git
+git clone https://github.com/anasakram-zynax/scrapper.git
+
 cd scrapper
 
 python3 -m venv .venv
